@@ -144,6 +144,7 @@ class TrajectoryReporter:
         self.metadata = metadata
 
         self.trajectories = []
+        self._file_cache: dict[str, TorchSimTrajectory] = {}
         if filenames is not None:
             filenames = (
                 [filenames]
@@ -158,6 +159,8 @@ class TrajectoryReporter:
                 )
                 for filename in filenames
             ]
+            for traj in self.trajectories:
+                self._file_cache[str(traj.filename)] = traj
 
         self._add_model_arg_to_prop_calculators()
 
@@ -176,7 +179,15 @@ class TrajectoryReporter:
     def reopen_trajectories(
         self, filenames: str | pathlib.Path | Sequence[str | pathlib.Path]
     ) -> None:
-        """Closes any existing trajectory files and reopens new ones given by filenames.
+        """Switch the active trajectory subset to the given filenames.
+
+        File handles are kept open in an internal cache to avoid the HDF5
+        file-locking race that occurs when closing and immediately reopening
+        the same file on Linux (POSIX flock release/acquire race, errno 11).
+
+        Files that were already opened are reused from the cache.  Files that
+        have not been seen before are opened in append mode and added to the
+        cache.
 
         Args:
             filenames (str | pathlib.Path | list[str | pathlib.Path]): Path(s) to save
@@ -185,29 +196,29 @@ class TrajectoryReporter:
         Raises:
             ValueError: If filenames are not unique
         """
-        self.finish()
-        self.trajectories = []  # drop refs so HDF5 finalizes before new opens
-
         filenames = (
             [filenames] if isinstance(filenames, (str, pathlib.Path)) else list(filenames)
         )
         filenames = [pathlib.Path(filename) for filename in filenames]
         if len(set(filenames)) != len(filenames):
             raise ValueError("All filenames must be unique.")
-        # Avoid wiping existing trajectory files when reopening them, hence
-        # we set to "a" mode temporarily (read mode is unaffected).
+
+        # Open any files we haven't seen before in append mode.
         _mode = self.trajectory_kwargs.get("mode", "w")
         self.trajectory_kwargs["mode"] = "a" if _mode in ["a", "w"] else "r"
-        self.trajectories = [
-            TorchSimTrajectory(
-                filename=filename,
-                metadata=self.metadata,
-                **self.trajectory_kwargs,
-            )
-            for filename in filenames
-        ]
-        # Restore original mode
+        for filename in filenames:
+            key = str(filename)
+            if key not in self._file_cache:
+                traj = TorchSimTrajectory(
+                    filename=filename,
+                    metadata=self.metadata,
+                    **self.trajectory_kwargs,
+                )
+                self._file_cache[key] = traj
         self.trajectory_kwargs["mode"] = _mode
+
+        # Set the active subset (order matters — matches system indices).
+        self.trajectories = [self._file_cache[str(f)] for f in filenames]
 
     @property
     def array_registry(self) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
@@ -399,18 +410,20 @@ class TrajectoryReporter:
     def finish(self) -> None:
         """Finish writing the trajectory files.
 
-        Closes all open trajectory files.
+        Closes all open trajectory files, including any cached handles.
         """
-        for trajectory in self.trajectories:
+        for trajectory in self._file_cache.values():
             trajectory.close()
+        self._file_cache.clear()
 
     def close(self) -> None:
         """Close all trajectory files.
 
-        Ensures all data is written to disk and releases the file handles.
+        Ensures all data is written to disk and releases all file handles.
         """
-        for trajectory in self.trajectories:
+        for trajectory in self._file_cache.values():
             trajectory.close()
+        self._file_cache.clear()
 
     @property
     def mode(self) -> Literal["r", "w", "a"]:
